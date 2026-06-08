@@ -1,0 +1,232 @@
+// fizz_stream_sentence_parser — LLM 出力 → 文 + タグの切り出し。
+//
+// 責務 (一行): LLM の応答テキストを「文 + [emotion]/[fx]/[hair] タグ」に切り出す。
+//
+// 旧 openaituber src/chat/emotionParser.ts の移植。文末記号 (。！？!?.)
+// で区切り、長い節は読点/空白の soft-end でも区切る。MAX_CHUNK を超えたら
+// 直近 soft-end で強制カット (Aivis TTS が長文で単語を落とす問題の回避)。
+// 各チャンクから先頭・埋め込みの角括弧タグを除去し、emotion/fx/hair を抽出。
+//
+// 文字列はすべて文字リスト (string.chars) で扱う — byte インデックス
+// 演算はマルチバイトで壊れるため (almide v0.25)。
+//
+// 入力 → 出力: String → List[fizz_protocol.speak.SentenceFragment]
+
+import fizz_protocol.emotion
+import fizz_protocol.speak
+
+// レコードフィールド位置では `[]: List[String]` 注釈が構文不可なので型付き空リストはヘルパ経由。
+local fn es() -> List[String] = []
+
+type Options = {
+  // soft-end (読点/空白) で区切る最小文字数。
+  soft_min: Int,
+  // 自然な区切りが無いまま伸びたとき強制カットする上限。
+  max_chunk: Int,
+}
+
+fn default_options() -> Options = Options { soft_min: 40, max_chunk: 80 }
+
+// ── 文字種判定 ───────────────────────────────────────────────────────
+
+local fn is_hard_end(c: String) -> Bool =
+  c == "。" or c == "！" or c == "？" or c == "!" or c == "?" or c == "."
+
+local fn is_soft_end(c: String) -> Bool =
+  c == "、" or c == "，" or c == "," or c == " " or c == "\t" or c == "\n" or c == "\r"
+
+local fn is_punct(c: String) -> Bool = is_hard_end(c) or is_soft_end(c)
+
+// ── 生セグメント分割 ─────────────────────────────────────────────────
+//
+// テキストを「完成した生セグメントのリスト + 末尾の未完成 remainder」に
+// 分ける。タグ解釈はここではしない (後段の parse_chunk が担当)。
+
+type ScanState = {
+  // 現在積んでいるセグメントの文字 (順序保持)。
+  seg: List[String],
+  // 直近 soft-end の「次の位置」(seg 内インデックス)。無ければ 0。
+  last_soft: Int,
+  // 確定した生セグメント。
+  out: List[String],
+}
+
+type Split = { segments: List[String], remainder: String }
+
+fn scan(text: String, opts: Options) -> Split = {
+  let chars = string.chars(text)
+  let final = list.fold(chars, ScanState { seg: es(), last_soft: 0, out: es() }, (st, c) =>
+    step(st, c, opts))
+  Split { segments: final.out, remainder: string.join(final.seg, "") }
+}
+
+local fn step(st: ScanState, c: String, opts: Options) -> ScanState = {
+  let seg2 = st.seg + [c]
+  let len2 = list.len(seg2)
+  if is_hard_end(c) then
+    ScanState { seg: es(), last_soft: 0, out: st.out + [string.join(seg2, "")] }
+  else if is_soft_end(c) and len2 >= opts.soft_min then
+    ScanState { seg: es(), last_soft: 0, out: st.out + [string.join(seg2, "")] }
+  else if is_soft_end(c) then
+    ScanState { seg: seg2, last_soft: len2, out: st.out }
+  else if len2 >= opts.max_chunk then {
+    // 強制カット: 直近 soft-end があればそこで、無ければ現在地で割る。
+    let cut = if st.last_soft > 0 then st.last_soft else len2
+    let prefix = list.take(seg2, cut)
+    let suffix = list.drop(seg2, cut)
+    ScanState { seg: suffix, last_soft: 0, out: st.out + [string.join(prefix, "")] }
+  }
+  else ScanState { seg: seg2, last_soft: st.last_soft, out: st.out }
+}
+
+// ── チャンク → SentenceFragment ──────────────────────────────────────
+//
+// 角括弧タグ ([happy] / [fx:nod] / [hair:short] / [motion:wave]) を抽出し、
+// 本文から除去する。emotion は最初の感情タグ (無ければ Neutral)、
+// fx/hair は最初の該当タグ。本文が空なら none。
+
+type TagScan = {
+  text: List[String],
+  emotion: Option[emotion.Emotion],
+  fx: Option[String],
+  hair: Option[String],
+  // 現在 '[' の内側か。
+  in_tag: Bool,
+  tag_body: List[String],
+}
+
+fn parse_chunk(raw: String) -> Option[speak.SentenceFragment] = {
+  let chars = string.chars(raw)
+  let init = TagScan { text: es(), emotion: none, fx: none, hair: none, in_tag: false, tag_body: es() }
+  let st = list.fold(chars, init, tag_step)
+  // 閉じなかった '[' は本文扱いに戻す (壊れたタグを飲み込まない)。
+  let text_chars = if st.in_tag then st.text + ["["] + st.tag_body else st.text
+  let message = string.trim(string.join(text_chars, ""))
+  guard message != "" else none
+  // 記号だけのチャンク (「。」など) は発話価値が無いので落とす。
+  let visible = list.filter(string.chars(message), (ch) => not is_punct(ch))
+  guard list.len(visible) > 0 else none
+  some(speak.SentenceFragment {
+    emotion: st.emotion ?? emotion.Neutral,
+    message: message,
+    hair: st.hair,
+    fx: st.fx,
+  })
+}
+
+local fn tag_step(st: TagScan, c: String) -> TagScan =
+  if st.in_tag then
+    if c == "]" then apply_tag(st, string.join(st.tag_body, ""))
+    else { ...st, tag_body: st.tag_body + [c] }
+  else if c == "[" then { ...st, in_tag: true, tag_body: es() }
+  else { ...st, text: st.text + [c] }
+
+// タグ本体を分類して状態へ反映。未知タグ (parse_tag_body が none) は破棄。
+local fn apply_tag(st: TagScan, body: String) -> TagScan = {
+  let closed = { ...st, in_tag: false, tag_body: es() }
+  match emotion.parse_tag_body(body) {
+    none => closed,
+    some(tag) => match tag {
+      emotion.EmotionTag(e) =>
+        match closed.emotion { some(_) => closed, none => { ...closed, emotion: some(e) } },
+      emotion.FxTag(name) =>
+        match closed.fx { some(_) => closed, none => { ...closed, fx: some(name) } },
+      emotion.HairTag(name) =>
+        match closed.hair { some(_) => closed, none => { ...closed, hair: some(name) } },
+      // action タグ (motion/sing/dance) は認識して捨てる。
+      // 注: モジュール越しの record-variant パターン (emotion.ActionTag { })
+      // は almide v0.25 codegen が壊すため _ で受ける。
+      _ => closed,
+    },
+  }
+}
+
+// ── 公開 API ─────────────────────────────────────────────────────────
+
+// 完成セグメントを SentenceFragment にしたものと、未完成の残りを返す。
+// ストリーミング時は remainder を次の入力に前置する。
+type FeedResult = {
+  fragments: List[speak.SentenceFragment],
+  remainder: String,
+}
+
+fn feed(text: String, opts: Options) -> FeedResult = {
+  let split = scan(text, opts)
+  FeedResult {
+    fragments: list.filter_map(split.segments, parse_chunk),
+    remainder: split.remainder,
+  }
+}
+
+// 非ストリーミング: テキスト全体を文に切り出す (remainder も最後の文として flush)。
+fn parse_all(text: String, opts: Options) -> List[speak.SentenceFragment] = {
+  let r = feed(text, opts)
+  match parse_chunk(r.remainder) {
+    some(f) => r.fragments + [f],
+    none    => r.fragments,
+  }
+}
+
+// ── in-file tests ────────────────────────────────────────────────────
+
+local fn msgs(frags: List[speak.SentenceFragment]) -> List[String] =
+  list.map(frags, (f) => f.message)
+
+test "splits on hard terminators" {
+  let frags = parse_all("こんにちは。元気ですか？はい！", default_options())
+  assert_eq(msgs(frags), ["こんにちは。", "元気ですか？", "はい！"])
+}
+
+test "extracts leading emotion and fx tags" {
+  let frags = parse_all("[excited][fx:banzai]やったー！", default_options())
+  let f = list.first(frags)!
+  assert_eq(f.emotion, emotion.Excited)
+  assert_eq(f.message, "やったー！")
+  assert_eq(f.fx, some("banzai"))
+}
+
+test "hair tag is captured and stripped" {
+  let frags = parse_all("[shy][hair:short]じゃあ少しだけ。", default_options())
+  let f = list.first(frags)!
+  assert_eq(f.emotion, emotion.Shy)
+  assert_eq(f.hair, some("short"))
+  assert_eq(f.message, "じゃあ少しだけ。")
+}
+
+test "action tags are recognized and dropped" {
+  let frags = parse_all("[happy][motion:wave]やあ。", default_options())
+  let f = list.first(frags)!
+  assert_eq(f.message, "やあ。")
+  assert_eq(f.fx, none)
+  assert_eq(f.emotion, emotion.Happy)
+}
+
+test "untagged text defaults to neutral" {
+  let frags = parse_all("ふつうの文。", default_options())
+  assert_eq(list.first(frags)!.emotion, emotion.Neutral)
+}
+
+test "soft-end split only after threshold" {
+  // soft_min=10 にすると読点で割れる
+  let opts = Options { soft_min: 10, max_chunk: 80 }
+  let frags = parse_all("これはとても長い前置きで、続きます。", opts)
+  assert_eq(list.len(frags), 2)
+}
+
+test "remainder is returned for incomplete streaming input" {
+  let r = feed("完成した文。これは途中", default_options())
+  assert_eq(msgs(r.fragments), ["完成した文。"])
+  assert_eq(r.remainder, "これは途中")
+}
+
+test "empty and whitespace-only chunks are dropped" {
+  let frags = parse_all("。。  ", default_options())
+  assert_eq(list.len(frags), 0)
+}
+
+test "max_chunk forces a split without terminators" {
+  let opts = Options { soft_min: 100, max_chunk: 5 }
+  // soft-end が無いので max_chunk で強制カット
+  let frags = parse_all("あいうえおかきくけこ", opts)
+  assert(list.len(frags) >= 2)
+}
