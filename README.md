@@ -10,7 +10,7 @@ LLM 出力 → 文 + `[emotion]/[fx]/[hair]` タグ切り出し。`parse_all` / 
 
 ```toml
 [dependencies]
-fizz_stream_sentence_parser = { git = "https://github.com/Aid-On/fizz-stream-sentence-parser", tag = "v0.1.0" }
+fizz_stream_sentence_parser = { git = "https://github.com/aiviecast/fizz-stream-sentence-parser", tag = "v0.1.0" }
 ```
 
 ## Tests
