@@ -54,19 +54,19 @@ type ScanState = {
 type Split = { segments: List[String], remainder: String }
 
 fn scan(text: String, opts: Options) -> Split = {
-  let chars = string.chars(text)
+  let chars = string.to_list(text)
   let final = list.fold(chars, ScanState { seg: es(), last_soft: 0, out: es() }, (st, c) =>
     step(st, c, opts))
-  Split { segments: final.out, remainder: string.join(final.seg, "") }
+  Split { segments: final.out, remainder: list.join(final.seg, "") }
 }
 
 local fn step(st: ScanState, c: String, opts: Options) -> ScanState = {
   let seg2 = st.seg + [c]
   let len2 = list.len(seg2)
   if is_hard_end(c) then
-    ScanState { seg: es(), last_soft: 0, out: st.out + [string.join(seg2, "")] }
+    ScanState { seg: es(), last_soft: 0, out: st.out + [list.join(seg2, "")] }
   else if is_soft_end(c) and len2 >= opts.soft_min then
-    ScanState { seg: es(), last_soft: 0, out: st.out + [string.join(seg2, "")] }
+    ScanState { seg: es(), last_soft: 0, out: st.out + [list.join(seg2, "")] }
   else if is_soft_end(c) then
     ScanState { seg: seg2, last_soft: len2, out: st.out }
   else if len2 >= opts.max_chunk then {
@@ -74,7 +74,7 @@ local fn step(st: ScanState, c: String, opts: Options) -> ScanState = {
     let cut = if st.last_soft > 0 then st.last_soft else len2
     let prefix = list.take(seg2, cut)
     let suffix = list.drop(seg2, cut)
-    ScanState { seg: suffix, last_soft: 0, out: st.out + [string.join(prefix, "")] }
+    ScanState { seg: suffix, last_soft: 0, out: st.out + [list.join(prefix, "")] }
   }
   else ScanState { seg: seg2, last_soft: st.last_soft, out: st.out }
 }
@@ -96,15 +96,15 @@ type TagScan = {
 }
 
 fn parse_chunk(raw: String) -> Option[speak.SentenceFragment] = {
-  let chars = string.chars(raw)
+  let chars = string.to_list(raw)
   let init = TagScan { text: es(), emotion: none, fx: none, hair: none, in_tag: false, tag_body: es() }
   let st = list.fold(chars, init, tag_step)
   // 閉じなかった '[' は本文扱いに戻す (壊れたタグを飲み込まない)。
   let text_chars = if st.in_tag then st.text + ["["] + st.tag_body else st.text
-  let message = string.trim(string.join(text_chars, ""))
+  let message = string.trim(list.join(text_chars, ""))
   guard message != "" else none
   // 記号だけのチャンク (「。」など) は発話価値が無いので落とす。
-  let visible = list.filter(string.chars(message), (ch) => not is_punct(ch))
+  let visible = list.filter(string.to_list(message), (ch) => not is_punct(ch))
   guard list.len(visible) > 0 else none
   some(speak.SentenceFragment {
     emotion: st.emotion ?? emotion.Neutral,
@@ -116,7 +116,7 @@ fn parse_chunk(raw: String) -> Option[speak.SentenceFragment] = {
 
 local fn tag_step(st: TagScan, c: String) -> TagScan =
   if st.in_tag then
-    if c == "]" then apply_tag(st, string.join(st.tag_body, ""))
+    if c == "]" then apply_tag(st, list.join(st.tag_body, ""))
     else { ...st, tag_body: st.tag_body + [c] }
   else if c == "[" then { ...st, in_tag: true, tag_body: es() }
   else { ...st, text: st.text + [c] }
